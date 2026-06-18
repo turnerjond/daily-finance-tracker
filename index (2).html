@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cash vs. Credit — Daily Ledger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #11151a; }
+  input[type=number]::-webkit-inner-spin-button { opacity: 0; }
+  .num-input {
+    font-family: 'IBM Plex Mono', monospace;
+    background: #1d2329;
+    border: 1px solid #262d35;
+    color: #e8ebee;
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-size: 15px;
+    width: 100%;
+    transition: border-color 0.15s;
+  }
+  .num-input:focus { outline: none; border-color: #5fd9a4; }
+  .num-input::placeholder { color: #545d68; }
+  button:focus-visible, input:focus-visible { outline: 2px solid #5fd9a4; outline-offset: 2px; }
+  .btn {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px;
+    font-weight: 500;
+    border-radius: 6px;
+    padding: 10px 16px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: opacity 0.15s, transform 0.1s;
+  }
+  .btn:active { transform: scale(0.98); }
+  .btn-primary { background: #5fd9a4; color: #0a1410; }
+  .btn-primary:hover { opacity: 0.9; }
+  .btn-ghost { background: transparent; border-color: #262d35; color: #8b95a1; }
+  .btn-ghost:hover { color: #e8ebee; border-color: #8b95a1; }
+  @media (max-width: 560px) {
+    .grid-2 { grid-template-columns: 1fr !important; }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } = Recharts;
+
+const STORAGE_KEY = 'finance_tracker_entries';
+const CONFIG_KEY = 'finance_tracker_config';
+
+function todayStr() {
+  const d = new Date();
+  return d.toISOString().slice(0, 10);
+}
+
+function fmtMoney(n) {
+  if (n === null || n === undefined || isNaN(n)) return '—';
+  const sign = n < 0 ? '-' : '';
+  return sign + '$' + Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function fmtMoneyShort(n) {
+  if (n === null || n === undefined || isNaN(n)) return '—';
+  const sign = n < 0 ? '-' : '';
+  return sign + '$' + Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 0 });
+}
+
+function fmtDateLabel(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+// Local storage helpers (replacing artifact's window.storage)
+const storage = {
+  get(key) {
+    try {
+      const v = localStorage.getItem(key);
+      return v === null ? null : { value: v };
+    } catch (e) { return null; }
+  },
+  set(key, value) {
+    try { localStorage.setItem(key, value); return true; } catch (e) { return false; }
+  },
+};
+
+function FinanceTracker() {
+  const [entries, setEntries] = useState({});
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [date, setDate] = useState(todayStr());
+  const [card1, setCard1] = useState('');
+  const [card2, setCard2] = useState('');
+  const [totalCredit, setTotalCredit] = useState('');
+  const [cash, setCash] = useState('');
+  const [netWorth, setNetWorth] = useState('');
+  const [card1Label, setCard1Label] = useState('Amazon Prime');
+  const [card2Label, setCard2Label] = useState('Chase Freedom');
+  const [editingLabels, setEditingLabels] = useState(false);
+  const [toast, setToast] = useState('');
+  const [scriptUrl, setScriptUrl] = useState('');
+  const [scriptUrlInput, setScriptUrlInput] = useState('');
+  const [showSettings, setShowSettings] = useState(false);
+  const [syncStatus, setSyncStatus] = useState('idle');
+  const [syncError, setSyncError] = useState('');
+
+  useEffect(() => {
+    let localScriptUrl = '';
+    try {
+      const result = storage.get(STORAGE_KEY);
+      if (result && result.value) {
+        const parsed = JSON.parse(result.value);
+        setEntries(parsed.entries || {});
+        if (parsed.card1Label) setCard1Label(parsed.card1Label);
+        if (parsed.card2Label) setCard2Label(parsed.card2Label);
+      }
+    } catch (e) {}
+    try {
+      const cfg = storage.get(CONFIG_KEY);
+      if (cfg && cfg.value) {
+        const parsedCfg = JSON.parse(cfg.value);
+        if (parsedCfg.scriptUrl) {
+          localScriptUrl = parsedCfg.scriptUrl;
+          setScriptUrl(parsedCfg.scriptUrl);
+          setScriptUrlInput(parsedCfg.scriptUrl);
+        }
+      }
+    } catch (e) {}
+    setLoaded(true);
+    if (localScriptUrl) pullFromSheet(localScriptUrl);
+  }, []);
+
+  async function pullFromSheet(urlOverride) {
+    const url = urlOverride || scriptUrl;
+    if (!url) return;
+    setSyncStatus('syncing');
+    setSyncError('');
+    try {
+      const res = await fetch(url, { method: 'GET' });
+      const data = await res.json();
+      if (data.ok) {
+        setEntries(data.entries || {});
+        if (data.card1Label) setCard1Label(data.card1Label);
+        if (data.card2Label) setCard2Label(data.card2Label);
+        storage.set(STORAGE_KEY, JSON.stringify({
+          entries: data.entries || {},
+          card1Label: data.card1Label,
+          card2Label: data.card2Label,
+        }));
+        setSyncStatus('ok');
+        showToast('Synced from sheet');
+      } else {
+        setSyncStatus('error');
+        setSyncError(data.error || 'Unknown error from script');
+      }
+    } catch (e) {
+      setSyncStatus('error');
+      setSyncError('Could not reach Apps Script. Check the URL and that it is deployed with access "Anyone".');
+    }
+  }
+
+  async function pushToSheet(entryPayload) {
+    if (!scriptUrl) return;
+    setSyncStatus('syncing');
+    setSyncError('');
+    try {
+      const res = await fetch(scriptUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: JSON.stringify(entryPayload),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setSyncStatus('ok');
+      } else {
+        setSyncStatus('error');
+        setSyncError(data.error || 'Unknown error from script');
+      }
+    } catch (e) {
+      setSyncStatus('error');
+      setSyncError('Could not reach Apps Script. Check the URL and that it is deployed with access "Anyone".');
+    }
+  }
+
+  async function handleSaveScriptUrl() {
+    const trimmed = scriptUrlInput.trim();
+    setScriptUrl(trimmed);
+    storage.set(CONFIG_KEY, JSON.stringify({ scriptUrl: trimmed }));
+    showToast(trimmed ? 'Script URL saved' : 'Script URL cleared');
+    if (trimmed) pullFromSheet(trimmed);
+  }
+
+  useEffect(() => {
+    if (!loaded) return;
+    const existing = entries[date];
+    if (existing) {
+      setCard1(existing.card1 ?? '');
+      setCard2(existing.card2 ?? '');
+      setTotalCredit(existing.totalCredit ?? '');
+      setCash(existing.cash ?? '');
+      setNetWorth(existing.netWorth ?? '');
+    } else {
+      setCard1('');
+      setCard2('');
+      setTotalCredit('');
+      setCash('');
+      setNetWorth('');
+    }
+  }, [date, loaded, entries]);
+
+  function persist(nextEntries, labels) {
+    setSaving(true);
+    try {
+      storage.set(STORAGE_KEY, JSON.stringify({
+        entries: nextEntries,
+        card1Label: (labels && labels.card1Label) ?? card1Label,
+        card2Label: (labels && labels.card2Label) ?? card2Label,
+      }));
+    } catch (e) { console.error('Storage error', e); }
+    setSaving(false);
+  }
+
+  function showToast(msg) {
+    setToast(msg);
+    setTimeout(() => setToast(''), 2200);
+  }
+
+  function handleSave() {
+    const num = (v) => v === '' ? null : parseFloat(v);
+    const entryData = {
+      card1: num(card1),
+      card2: num(card2),
+      totalCredit: num(totalCredit),
+      cash: num(cash),
+      netWorth: num(netWorth),
+    };
+    const next = { ...entries, [date]: entryData };
+    setEntries(next);
+    persist(next);
+    showToast(scriptUrl ? 'Saved · syncing…' : 'Saved');
+    if (scriptUrl) pushToSheet({ date, ...entryData });
+  }
+
+  function handleSaveLabels() {
+    persist(entries, { card1Label, card2Label });
+    setEditingLabels(false);
+    if (scriptUrl) pushToSheet({ action: 'labels', card1Label, card2Label });
+  }
+
+  const sortedDates = useMemo(() => Object.keys(entries).sort(), [entries]);
+
+  const trailing14 = useMemo(() => {
+    return sortedDates.slice(-14).map((d) => {
+      const e = entries[d];
+      const totalCredit = e.totalCredit ?? 0;
+      const cashMinusCredit = (e.cash ?? 0) - totalCredit;
+      return {
+        date: d,
+        label: fmtDateLabel(d),
+        totalCredit: e.totalCredit ?? null,
+        cash: e.cash ?? null,
+        cashMinusCredit,
+        netWorth: e.netWorth ?? null,
+      };
+    });
+  }, [sortedDates, entries]);
+
+  const liveTotalCredit = parseFloat(totalCredit) || 0;
+  const liveCash = parseFloat(cash) || 0;
+  const liveCashMinusCredit = liveCash - liveTotalCredit;
+  const hasAnyInput = card1 !== '' || card2 !== '' || totalCredit !== '' || cash !== '';
+
+  const latest = trailing14.length ? trailing14[trailing14.length - 1] : null;
+  const prior = trailing14.length > 1 ? trailing14[trailing14.length - 2] : null;
+
+  const tone = {
+    bg: '#11151a', panel: '#171c22', panelAlt: '#1d2329', border: '#262d35',
+    text: '#e8ebee', sub: '#8b95a1', accent: '#5fd9a4', accentDim: '#2f6e54',
+    warn: '#e0985a', credit: '#c47a7a',
+  };
+
+  return (
+    <div style={{ minHeight: '100vh', background: tone.bg, color: tone.text, fontFamily: "'IBM Plex Sans', 'Segoe UI', sans-serif", padding: '24px 16px 80px' }}>
+      <div style={{ maxWidth: 720, margin: '0 auto' }}>
+        <div style={{ marginBottom: 28, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+          <div>
+            <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: tone.sub, letterSpacing: '0.12em', textTransform: 'uppercase', marginBottom: 4 }}>
+              Daily Ledger
+            </div>
+            <h1 style={{ fontSize: 26, fontWeight: 600, margin: 0 }}>Cash vs. Credit</h1>
+          </div>
+          <button className="btn btn-ghost" onClick={() => setShowSettings(!showSettings)} style={{ padding: '8px 12px' }}>
+            {scriptUrl ? (syncStatus === 'syncing' ? '⟳ syncing' : syncStatus === 'error' ? '⚠ sheet' : '✓ sheet') : '⚙ connect sheet'}
+          </button>
+        </div>
+
+        {showSettings && (
+          <div style={{ background: tone.panel, border: `1px solid ${tone.border}`, borderRadius: 12, padding: 18, marginBottom: 20 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>Google Sheet sync</div>
+            <div style={{ fontSize: 12, color: tone.sub, marginBottom: 12, lineHeight: 1.5 }}>
+              Paste your deployed Apps Script web app URL.
+            </div>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+              <input className="num-input" type="text" value={scriptUrlInput} onChange={(e) => setScriptUrlInput(e.target.value)} placeholder="https://script.google.com/macros/s/.../exec" style={{ flex: 1, fontSize: 12 }} />
+              <button className="btn btn-primary" onClick={handleSaveScriptUrl}>Save</button>
+            </div>
+            {scriptUrl && (
+              <button className="btn btn-ghost" onClick={() => pullFromSheet()} style={{ fontSize: 12 }}>Pull latest from sheet</button>
+            )}
+            {syncStatus === 'error' && (
+              <div style={{ marginTop: 10, fontSize: 12, color: tone.credit, lineHeight: 1.5 }}>{syncError}. Data is still saved locally on this device.</div>
+            )}
+          </div>
+        )}
+
+        <div style={{ background: tone.panel, border: `1px solid ${tone.border}`, borderRadius: 12, padding: 20, marginBottom: 24 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+            <input type="date" value={date} max={todayStr()} onChange={(e) => setDate(e.target.value)} style={{ fontFamily: "'IBM Plex Mono', monospace", background: 'transparent', border: 'none', color: tone.text, fontSize: 15, fontWeight: 500 }} />
+            {entries[date] && <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: tone.accent }}>● recorded</span>}
+          </div>
+
+          <div className="grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+            <Field label={card1Label} value={card1} onChange={setCard1} placeholder="0.00" />
+            <Field label={card2Label} value={card2} onChange={setCard2} placeholder="0.00" />
+          </div>
+          <div className="grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+            <Field label="Total credit" value={totalCredit} onChange={setTotalCredit} placeholder="0.00" hint="incl. both cards" />
+            <Field label="Spendable cash" value={cash} onChange={setCash} placeholder="0.00" />
+          </div>
+          <div style={{ marginBottom: 16 }}>
+            <Field label="Net worth" value={netWorth} onChange={setNetWorth} placeholder="0.00" hint="entered directly" />
+          </div>
+
+          {hasAnyInput && (
+            <div style={{ background: tone.panelAlt, borderRadius: 8, padding: '12px 14px', marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+              <span style={{ fontSize: 12, color: tone.sub }}>Cash − Credit (live)</span>
+              <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 18, fontWeight: 600, color: liveCashMinusCredit >= 0 ? tone.accent : tone.credit }}>{fmtMoney(liveCashMinusCredit)}</span>
+            </div>
+          )}
+
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            <button className="btn btn-primary" onClick={handleSave} disabled={saving}>{entries[date] ? 'Update entry' : 'Save entry'}</button>
+            <button className="btn btn-ghost" onClick={() => setEditingLabels(!editingLabels)}>Rename cards</button>
+            {toast && <span style={{ fontSize: 12, color: tone.accent, fontFamily: "'IBM Plex Mono', monospace" }}>{toast}</span>}
+          </div>
+
+          {editingLabels && (
+            <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${tone.border}`, display: 'flex', gap: 10 }}>
+              <input className="num-input" value={card1Label} onChange={(e) => setCard1Label(e.target.value)} placeholder="Card 1 name" />
+              <input className="num-input" value={card2Label} onChange={(e) => setCard2Label(e.target.value)} placeholder="Card 2 name" />
+              <button className="btn btn-primary" onClick={handleSaveLabels}>Save</button>
+            </div>
+          )}
+        </div>
+
+        {latest && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12, marginBottom: 28 }}>
+            <SummaryCard label="Total credit" value={latest.totalCredit} prev={prior && prior.totalCredit} tone={tone} invert />
+            <SummaryCard label="Spendable cash" value={latest.cash} prev={prior && prior.cash} tone={tone} />
+            <SummaryCard label="Cash − Credit" value={latest.cashMinusCredit} prev={prior && prior.cashMinusCredit} tone={tone} accent />
+            <SummaryCard label="Net worth" value={latest.netWorth} prev={prior && prior.netWorth} tone={tone} />
+          </div>
+        )}
+
+        {trailing14.length >= 2 ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+            <ChartBlock title="Cash − Credit · 14d" data={trailing14} dataKey="cashMinusCredit" color={tone.accent} tone={tone} zeroLine />
+            <ChartBlock title="Net worth · 14d" data={trailing14} dataKey="netWorth" color="#7aa6d9" tone={tone} />
+            <ChartBlock title="Total credit · 14d" data={trailing14} dataKey="totalCredit" color={tone.credit} tone={tone} />
+            <ChartBlock title="Spendable cash · 14d" data={trailing14} dataKey="cash" color="#c9b35f" tone={tone} />
+          </div>
+        ) : (
+          <div style={{ textAlign: 'center', padding: '40px 20px', color: tone.sub, fontSize: 13, border: `1px dashed ${tone.border}`, borderRadius: 12 }}>
+            Charts appear once you've saved at least 2 days of entries.
+          </div>
+        )}
+
+        {sortedDates.length > 0 && (
+          <div style={{ marginTop: 28, fontSize: 12, color: tone.sub, textAlign: 'center' }}>
+            {sortedDates.length} day{sortedDates.length === 1 ? '' : 's'} recorded
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, value, onChange, placeholder, hint }) {
+  return (
+    <div>
+      <label style={{ display: 'block', fontSize: 12, color: '#8b95a1', marginBottom: 6 }}>
+        {label}{hint && <span style={{ color: '#545d68' }}> · {hint}</span>}
+      </label>
+      <input className="num-input" type="number" inputMode="decimal" step="0.01" value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} />
+    </div>
+  );
+}
+
+function SummaryCard({ label, value, prev, tone, accent, invert }) {
+  const d = (value !== null && value !== undefined && prev !== null && prev !== undefined) ? value - prev : null;
+  let deltaColor = tone.sub;
+  if (d !== null && d !== 0) {
+    const positive = invert ? d < 0 : d > 0;
+    deltaColor = positive ? tone.accent : tone.credit;
+  }
+  return (
+    <div style={{ background: tone.panel, border: `1px solid ${tone.border}`, borderRadius: 10, padding: '14px 16px' }}>
+      <div style={{ fontSize: 11, color: tone.sub, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</div>
+      <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 19, fontWeight: 600, color: accent ? (value >= 0 ? tone.accent : tone.credit) : tone.text }}>{fmtMoney(value)}</div>
+      {d !== null && (
+        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: deltaColor, marginTop: 3 }}>{d >= 0 ? '↑' : '↓'} {fmtMoney(Math.abs(d))} vs prior day</div>
+      )}
+    </div>
+  );
+}
+
+function ChartBlock({ title, data, dataKey, color, tone, zeroLine }) {
+  return (
+    <div style={{ background: tone.panel, border: `1px solid ${tone.border}`, borderRadius: 12, padding: '16px 8px 8px 0' }}>
+      <div style={{ fontSize: 12, color: tone.sub, marginBottom: 4, paddingLeft: 16, fontFamily: "'IBM Plex Mono', monospace" }}>{title}</div>
+      <ResponsiveContainer width="100%" height={140}>
+        <LineChart data={data} margin={{ top: 8, right: 16, bottom: 0, left: 0 }}>
+          <CartesianGrid stroke={tone.border} strokeDasharray="3 3" vertical={false} />
+          <XAxis dataKey="label" tick={{ fontSize: 10, fill: tone.sub }} axisLine={{ stroke: tone.border }} tickLine={false} />
+          <YAxis tick={{ fontSize: 10, fill: tone.sub }} axisLine={false} tickLine={false} width={48} tickFormatter={fmtMoneyShort} />
+          {zeroLine && <ReferenceLine y={0} stroke={tone.border} />}
+          <Tooltip contentStyle={{ background: tone.panelAlt, border: `1px solid ${tone.border}`, borderRadius: 8, fontSize: 12 }} labelStyle={{ color: tone.sub }} formatter={(v) => [fmtMoney(v), '']} />
+          <Line type="monotone" dataKey={dataKey} stroke={color} strokeWidth={2} dot={{ r: 3, fill: color, strokeWidth: 0 }} activeDot={{ r: 5 }} connectNulls />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<FinanceTracker />);
+</script>
+</body>
+</html>
