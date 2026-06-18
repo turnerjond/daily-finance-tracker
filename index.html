@@ -250,6 +250,21 @@
     return Object.keys(entries).sort();
   }
 
+  function getEntryDaysAgo(fromDate, days) {
+    // finds the closest recorded entry at or before (fromDate - days)
+    const d = new Date(fromDate + 'T00:00:00');
+    d.setDate(d.getDate() - days);
+    const target = d.toISOString().slice(0, 10);
+    // find the most recent entry on or before target
+    const sorted = getSortedDates();
+    let best = null;
+    for (const date of sorted) {
+      if (date <= target) best = date;
+      else break;
+    }
+    return best ? entries[best] : null;
+  }
+
   function getTrailing14() {
     return getSortedDates().slice(-14).map((d) => {
       const e = entries[d];
@@ -410,13 +425,29 @@
     const prior = trailing14.length > 1 ? trailing14[trailing14.length - 2] : null;
     const existing = entries[currentDate];
 
-    function deltaHTML(curr, prev, invert) {
-      if (curr === null || curr === undefined || prev === null || prev === undefined) return '';
-      const d = curr - prev;
-      const positive = invert ? d < 0 : d > 0;
-      const color = d === 0 ? '#8b95a1' : (positive ? '#5fd9a4' : '#c47a7a');
-      const arrow = d >= 0 ? '↑' : '↓';
-      return `<div class="summary-delta" style="color:${color}">${arrow} ${esc(fmtMoney(Math.abs(d)))} vs prior day</div>`;
+    // 7-days-ago entry relative to the latest recorded date
+    const sevenDaysAgo = latest ? getEntryDaysAgo(latest.date, 7) : null;
+
+    function deltaHTML(curr, dayPrior, day7, invert) {
+      const parts = [];
+      if (curr !== null && curr !== undefined) {
+        if (dayPrior !== null && dayPrior !== undefined) {
+          const d = curr - dayPrior;
+          const positive = invert ? d < 0 : d > 0;
+          const color = d === 0 ? '#8b95a1' : (positive ? '#5fd9a4' : '#c47a7a');
+          const arrow = d >= 0 ? '↑' : '↓';
+          parts.push(`<span style="color:${color}">${arrow} ${esc(fmtMoney(Math.abs(d)))}</span> <span style="color:#545d68">1d</span>`);
+        }
+        if (day7 !== null && day7 !== undefined) {
+          const d7 = curr - day7;
+          const positive7 = invert ? d7 < 0 : d7 > 0;
+          const color7 = d7 === 0 ? '#8b95a1' : (positive7 ? '#5fd9a4' : '#c47a7a');
+          const arrow7 = d7 >= 0 ? '↑' : '↓';
+          parts.push(`<span style="color:${color7}">${arrow7} ${esc(fmtMoney(Math.abs(d7)))}</span> <span style="color:#545d68">7d</span>`);
+        }
+      }
+      if (!parts.length) return '';
+      return `<div class="summary-delta mono">${parts.join('<span style="color:#3a434d"> · </span>')}</div>`;
     }
 
     const syncBtnLabel = scriptUrl
@@ -499,26 +530,32 @@
       </div>
 
       ${latest ? `
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;">
+          <div style="font-size:11px;color:#8b95a1;text-transform:uppercase;letter-spacing:0.08em;">Latest snapshot</div>
+          <div style="font-size:11px;font-family:'SFMono-Regular',Consolas,Menlo,monospace;color:${latest.date === todayStr() ? '#8b95a1' : '#e0985a'};">
+            ${latest.date === todayStr() ? 'today' : 'as of ' + esc(fmtDateLabel(latest.date))}
+          </div>
+        </div>
         <div class="summary-grid">
           <div class="summary-card">
             <div class="summary-label">Total credit</div>
             <div class="summary-value mono">${esc(fmtMoney(latest.totalCredit))}</div>
-            ${deltaHTML(latest.totalCredit, prior && prior.totalCredit, true)}
+            ${deltaHTML(latest.totalCredit, prior && prior.totalCredit, sevenDaysAgo && sevenDaysAgo.totalCredit, true)}
           </div>
           <div class="summary-card">
             <div class="summary-label">Spendable cash</div>
             <div class="summary-value mono">${esc(fmtMoney(latest.cash))}</div>
-            ${deltaHTML(latest.cash, prior && prior.cash, false)}
+            ${deltaHTML(latest.cash, prior && prior.cash, sevenDaysAgo && sevenDaysAgo.cash, false)}
           </div>
           <div class="summary-card">
             <div class="summary-label">Cash − Credit</div>
             <div class="summary-value mono" style="color:${(latest.cashMinusCredit ?? 0) >= 0 ? '#5fd9a4' : '#c47a7a'}">${esc(fmtMoney(latest.cashMinusCredit))}</div>
-            ${deltaHTML(latest.cashMinusCredit, prior && prior.cashMinusCredit, false)}
+            ${deltaHTML(latest.cashMinusCredit, prior && prior.cashMinusCredit, sevenDaysAgo ? ((sevenDaysAgo.cash ?? 0) - (sevenDaysAgo.totalCredit ?? 0)) : null, false)}
           </div>
           <div class="summary-card">
             <div class="summary-label">Net worth</div>
             <div class="summary-value mono">${esc(fmtMoney(latest.netWorth))}</div>
-            ${deltaHTML(latest.netWorth, prior && prior.netWorth, false)}
+            ${deltaHTML(latest.netWorth, prior && prior.netWorth, sevenDaysAgo && sevenDaysAgo.netWorth, false)}
           </div>
         </div>
       ` : ''}
@@ -543,11 +580,11 @@
     document.getElementById('btn-save').addEventListener('click', handleSave);
     document.getElementById('btn-rename').addEventListener('click', () => { editingLabels = !editingLabels; render(); });
 
-    ['field-totalCredit', 'field-cash'].forEach((id) => {
+    ['field-card1', 'field-card2', 'field-totalCredit', 'field-cash', 'field-netWorth'].forEach((id) => {
       const el = document.getElementById(id);
       if (el) el.addEventListener('input', updateLiveBox);
     });
-    updateLiveBox();
+    setTimeout(updateLiveBox, 0);
 
     if (showSettings) {
       document.getElementById('btn-save-url').addEventListener('click', handleSaveScriptUrl);
@@ -570,7 +607,8 @@
     const cashEl = document.getElementById('field-cash');
     const c1 = document.getElementById('field-card1');
     const c2 = document.getElementById('field-card2');
-    const hasAny = (tcEl && tcEl.value !== '') || (cashEl && cashEl.value !== '') || (c1 && c1.value !== '') || (c2 && c2.value !== '');
+    const nwEl = document.getElementById('field-netWorth');
+    const hasAny = [tcEl, cashEl, c1, c2, nwEl].some((el) => el && el.value !== '');
     if (!hasAny) {
       liveBox.style.display = 'none';
       return;
